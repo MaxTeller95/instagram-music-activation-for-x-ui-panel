@@ -1,8 +1,8 @@
 # Instagram Music Activation for x-ui panel
 
 Bring back the **Instagram Music sticker** when your x-ui server exits through a
-datacenter / VPN IP, **without** paying for a residential proxy on your whole
-Instagram traffic.
+datacenter / VPN IP, with a single **static** routing rule — no timers, no
+background services, no restart loops.
 
 ## The problem
 
@@ -15,54 +15,49 @@ music icon) when it sees your connection coming from:
 If your traffic goes out through such an exit, music disappears even though
 everything else works.
 
-## The idea (and why it's cheap)
+## How Instagram decides your location
 
-Instagram decides whether music is available from a small **region-check API
-call** to `i.instagram.com`, and then **caches that decision server-side** for a
-while. The heavy stuff — reels, photos, video, even the music audio clips — is
-delivered separately (`*.cdninstagram.com`) and does **not** need a special IP.
+Instagram reads your region from the **IP of your app's calls to
+`i.instagram.com`** (its main private API; `b.i.instagram.com` is a mirror).
+Whatever IP those calls come from is the region Instagram registers for your
+account — and that region gates the music sticker. The heavy media
+(`*.cdninstagram.com`, reels, photos, video, the music audio itself) is just a
+CDN and plays no part in the location decision.
 
-So this tool routes **only `i.instagram.com`**, **only for a few minutes when
-needed**, through a **residential SOCKS outbound** you add to x-ui. That
-re-registers your account in a music-enabled region while the account's cache
-keeps music visible — and essentially no traffic goes through the (metered,
-expensive) residential proxy.
+## What this tool does
+
+It permanently routes **only those two region-check hosts** through an outbound
+you add to x-ui whose egress IP is in the **US** (or another music-licensed
+country). Everything else keeps using your normal, free exit.
 
 ```
- app -> x-ui -> i.instagram.com   (region check)   -> residential   <- tiny, only when needed
-              \> everything else  (feed, media, ...) -> your normal exit  <- free
+ app -> x-ui -> i.instagram.com / b.i.instagram.com  -> IGMUSIC outbound (US IP)
+              \> everything else (feed, media, reels) -> your normal exit  (free)
 ```
 
-Nothing else in your panel is touched: only one routing rule is added/removed,
-the panel version and all your other routing stay exactly as they are, and
-`x-ui.db` is backed up before structural changes.
+Because Instagram now always sees the region check from the US IP, the music
+sticker stays — with no timers, watchers or refresh cycles. It's one static
+routing rule. `x-ui.db` is backed up before the change and nothing else in your
+panel is touched.
 
-## Two refresh modes
+## The outbound: any config with a US IP
 
-- **reactive** *(default, recommended)* — a lightweight watcher reads x-ui's
-  access log and notices **when you are actually using Instagram**, then refreshes
-  the region right then, at most once per `--cooldown`. Residential is touched
-  **only while you use Instagram** and never on a blind schedule, so it can't
-  "miss" you (the failure mode of a fixed timer) and burns almost no data.
-- **timer** — refresh on a fixed `--interval` via a systemd timer, whether or not
-  the app is open. Simpler, but music can lapse if the window doesn't overlap
-  your usage.
+The `IGMUSIC` outbound can be **any protocol your x-ui panel supports**, as long
+as its **egress IP is a US IP** (or another Instagram-music country):
 
-## Requirements
+- a **residential / mobile SOCKS or HTTP proxy** in the US (most reliable), or
+- **VLESS / VMess / Trojan / Shadowsocks** to a US server you own, or
+- **WireGuard**, etc.
 
-- A working **x-ui / 3x-ui** panel (uses `xrayTemplateConfig` in `x-ui.db`).
-- A **residential proxy** (SOCKS5) in a music-licensed country (US, GB, DE, ...).
-  Datacenter proxies usually won't unlock music — `igmusic check` warns you if
-  yours looks like a datacenter IP.
-- Reactive mode uses x-ui's Xray **access log**; the installer enables it if it's
-  off.
+A residential/mobile US IP is the most reliable; a plain US datacenter IP may
+still work but Instagram trusts it less. `igmusic check` tells you the egress
+IP, its country, and whether it looks residential.
 
 ## Install
 
 1. In the x-ui panel: **Xray Settings → Outbounds → +**
-   - Protocol: `socks`
-   - **Tag: `residental`**
-   - Address / Port / Username / Password: your residential proxy
+   - Add any outbound (see above) whose exit IP is in the US.
+   - **Tag it: `IGMUSIC`**
    - Save.
 
 2. On the server:
@@ -73,44 +68,31 @@ cd instagram-music-activation-for-x-ui-panel
 sudo bash install.sh
 ```
 
-The installer verifies the proxy (egress country + residential check), enables the
-reactive watcher, and does a first activation. Close and reopen Instagram — the
-Music sticker is back.
+Close and reopen Instagram — the Music sticker is back.
 
 ## Usage
 
 ```bash
-sudo igmusic check       # verify x-ui + the residential proxy egress
-sudo igmusic install     # enable automatic activation (reactive mode)
-sudo igmusic status      # mode, route state, watcher, last refresh, residential MB
-sudo igmusic refresh     # run one refresh cycle right now
-sudo igmusic on|off      # manually pin the route on / off
-sudo igmusic uninstall   # remove the watcher/timer, Instagram back to the normal exit
+sudo igmusic check          # verify x-ui + the outbound, show its egress IP/country
+sudo igmusic install        # add the static rule (region check -> IGMUSIC)
+sudo igmusic status         # show route state + how much data used the outbound
+sudo igmusic uninstall      # remove the rule (Instagram back on the normal exit)
 
-# tuning
-sudo igmusic install --cooldown 90 --window 180        # reactive: min minutes between refreshes / on-window
-sudo igmusic install --mode timer --interval 90        # switch to the fixed-timer mode
+sudo igmusic install --tag MYNAME   # if you named the outbound something else
 ```
-
-## How it stays cheap
-
-- Only `i.instagram.com` (JSON API) is ever routed through residential — never the
-  media CDNs. Media, reels and the music audio go through your free exit.
-- Reactive mode touches residential **only while you're using Instagram**, at most
-  once per cooldown.
-- `igmusic status` prints how many MB actually went through the residential
-  outbound.
 
 ## Notes & caveats
 
-- Each refresh briefly **restarts Xray** (a few seconds) to apply the routing
-  change. Reactive mode does this at most once per cooldown, only when you use
-  Instagram.
+- Only `i.instagram.com` / `b.i.instagram.com` (small JSON API) go through the
+  outbound — never the media CDNs, so reels/photos/video and the music audio
+  stay on your free exit.
+- Applying / removing the rule restarts Xray once (a few seconds); after that it
+  is completely static.
 - Music availability also depends on your **account's region**. If the account
   itself is set to a no-music country, an IP alone may not be enough.
-- Instagram may show a **"suspicious login / verify it's you"** the first time the
-  API appears from a new country — just confirm it.
-- A **sticky** residential session (stable IP) is best so the region stays
+- Instagram may show a **"suspicious login / verify it's you"** the first time
+  the API appears from a new country — just confirm it.
+- A **sticky** outbound IP (stable, not rapidly rotating) keeps the region
   consistent.
 
 ## License

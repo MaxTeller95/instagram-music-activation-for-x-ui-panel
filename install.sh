@@ -2,7 +2,7 @@
 # Installer for igmusic - Instagram Music Activation for x-ui panel.
 #   sudo bash install.sh
 # Copies the `igmusic` CLI to /usr/local/sbin, checks prerequisites, and (if the
-# residential outbound is present) enables the automatic refresh timer.
+# IGMUSIC outbound is present) adds the static region-check routing rule.
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run as root: sudo bash install.sh"; exit 1; }
 
@@ -16,10 +16,11 @@ echo
 echo "==> checking prerequisites"
 if igmusic check; then
   echo
-  echo "==> enabling automatic activation"
+  echo "==> applying the static rule"
   igmusic install
 else
   echo
-  echo "Add a SOCKS outbound tagged 'residental' in the x-ui panel, then run:"
-  echo "    sudo igmusic install"
+  echo "Add an outbound tagged 'IGMUSIC' with a US egress IP in the x-ui panel"
+  echo "(any protocol: socks/http proxy, vless, vmess, trojan, shadowsocks, wireguard),"
+  echo "then run:  sudo igmusic install"
 fi

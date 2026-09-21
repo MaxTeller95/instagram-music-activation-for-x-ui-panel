@@ -3,41 +3,38 @@
 igmusic - Instagram Music Activation for x-ui panel
 ====================================================
 
-Instagram hides the "Music" sticker when it sees your connection coming from a
-datacenter / VPN IP, or from a region without music licensing. If your x-ui
-server exits through such an IP, the music icon disappears even though everything
-else works.
+Instagram decides whether the "Music" sticker is available from the IP of your
+app's calls to `i.instagram.com` (its main private API). If your x-ui server
+exits through a datacenter / VPN IP, or a region without music licensing, the
+music icon disappears even though everything else works.
 
-This tool fixes that WITHOUT sending all your Instagram traffic through an
-expensive residential proxy. It routes ONLY the tiny Instagram region-check API
-(`i.instagram.com`) through a residential SOCKS outbound you add to x-ui, and
-only for a few minutes when it's actually needed. Instagram registers your
-account's region as the residential IP's country and caches it server-side for a
-while, so the music icon stays visible - while every heavy byte (reels, photos,
-video, even the music audio) keeps flowing through your normal, free exit.
+This tool permanently routes ONLY the Instagram region-check API hosts
+(`i.instagram.com`, `b.i.instagram.com`) through an outbound you add to x-ui -
+an outbound whose egress IP is in the US (or any Instagram-music country).
+Instagram then registers your account's region from that IP and the music
+sticker stays. Everything else - reels, photos, video, even the music audio -
+keeps using your normal, free exit.
 
-    app -> x-ui -> i.instagram.com   (region check)  -> residential   [tiny, only when needed]
-                \> everything else                    -> your normal exit  [free]
+    app -> x-ui -> i.instagram.com / b.i.instagram.com  -> IGMUSIC outbound (US IP)
+                \> everything else                        -> your normal exit  (free)
 
-Two refresh modes:
-  reactive (default, recommended) - a lightweight watcher notices when you're
-      actually using Instagram (from x-ui's access log) and refreshes the region
-      then, at most once per cooldown. Zero residential traffic when you're not
-      using Instagram, and it never "misses" you the way a blind timer can.
-  timer - refresh on a fixed schedule (systemd timer), whether or not the app is
-      open. Simpler, but can lapse if the window doesn't overlap your usage.
+It is a single, STATIC routing rule: no timer, no refresh, no watcher, no restart
+loops. x-ui.db is backed up before the change and nothing else in your panel is
+touched.
 
 PREREQUISITE
 ------------
-In the x-ui panel add an OUTBOUND:
-    Protocol : socks
-    Tag      : residental
-    Address / Port / user / pass : your residential proxy in a music-enabled country
+In the x-ui panel add an OUTBOUND whose egress IP is in the US (or another
+Instagram-music country). It can be ANY protocol your panel supports - a
+SOCKS/HTTP residential proxy, VLESS / VMess / Trojan / Shadowsocks to a US
+server, WireGuard, etc. - the only thing that matters is that its exit IP is a
+US IP. Give the outbound the tag:
+
+    IGMUSIC
+
 Then run:  sudo igmusic install
 
-Commands:  check | install | watch | refresh | on | off | status | uninstall
-Only the `residental` routing rule is ever touched; the panel version and all your
-other routing stay intact. x-ui.db is backed up before structural changes.
+Commands: check | install | uninstall | status
 """
 from __future__ import annotations
 
@@ -56,25 +53,16 @@ APP = "igmusic"
 CONF_DIR = "/etc/igmusic"
 CONF = os.path.join(CONF_DIR, "config.json")
 BACKUPS = os.path.join(CONF_DIR, "backups")
-STATE = "/var/lib/igmusic/last_refresh"
-WATCH_LOG = "/var/log/igmusic-watch.log"
-SVC_REFRESH = "/etc/systemd/system/igmusic-refresh.service"
-TIMER = "/etc/systemd/system/igmusic-refresh.timer"
-SVC_WATCH = "/etc/systemd/system/igmusic-watch.service"
 TEMPLATE_KEY = "xrayTemplateConfig"
 
 DEFAULTS = {
     "xui_db": "",                       # auto-detected when empty
-    "outbound_tag": "residental",
-    "hosts": ["full:i.instagram.com"],  # the region-check API; keep it minimal to save data
-    "mode": "reactive",                 # reactive | timer
-    "cooldown_min": 90,                 # reactive: min minutes between refreshes
-    "interval_min": 90,                 # timer: minutes between refreshes
-    "window_sec": 180,                  # both: seconds the route stays on per refresh
-    "access_log": "",                   # reactive: auto-detected when empty
+    "outbound_tag": "IGMUSIC",          # the US-IP outbound you added in the panel
+    # Instagram reads your region from these API hosts; the heavy media (cdninstagram)
+    # is deliberately NOT here, so it keeps using your free exit.
+    "hosts": ["full:i.instagram.com", "full:b.i.instagram.com"],
 }
 
-# ------------------------------------------------------------------ output --
 _TTY = sys.stdout.isatty()
 def _c(code, s): return f"\033[{code}m{s}\033[0m" if _TTY else s
 def ok(s):   print(_c("32", "[ok] ") + s)
@@ -91,14 +79,6 @@ def need_root():
 
 def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
-
-
-def wlog(msg):
-    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
-    try:
-        open(WATCH_LOG, "a").write(line + "\n")
-    except Exception:
-        pass
 
 
 # ----------------------------------------------------------- x-ui plumbing --
@@ -124,20 +104,6 @@ def running_config():
         if os.path.exists(p):
             return p
     return None
-
-
-def access_log_path(cfg):
-    if cfg.get("access_log"):
-        return cfg["access_log"]
-    rc = running_config()
-    if rc:
-        try:
-            acc = json.load(open(rc)).get("log", {}).get("access", "")
-            if acc and acc not in ("none", "None"):
-                return acc if acc.startswith("/") else os.path.normpath(os.path.join("/usr/local/x-ui", acc))
-        except Exception:
-            pass
-    return "/usr/local/x-ui/access.log"
 
 
 def load_config():
@@ -196,19 +162,18 @@ def restart_xui():
     time.sleep(2)
 
 
-def set_route(cfg, on: bool, backup=True):
-    """Add or remove the single `residental` routing rule; leave everything else intact."""
+def set_route(cfg, on: bool):
+    """Add or remove the single static rule that sends the region-check hosts to the outbound."""
     db = cfg["xui_db"]; tag = cfg["outbound_tag"]
     tpl = read_template(db)
-    if not get_outbound(tpl, tag):
-        die(f"no outbound tagged '{tag}' in the panel. Add a SOCKS outbound with that tag first "
+    if on and not get_outbound(tpl, tag):
+        die(f"no outbound tagged '{tag}' in the panel. Add a US-IP outbound with that tag first "
             f"(see `igmusic check`).")
     rules = [r for r in tpl["routing"].get("rules", []) if r.get("outboundTag") != tag]
     if on:
         rules.insert(0, {"type": "field", "outboundTag": tag, "domain": list(cfg["hosts"])})
     tpl["routing"]["rules"] = rules
-    if backup:
-        backup_db(db)
+    backup_db(db)
     write_template(db, tpl)
     restart_xui()
 
@@ -224,56 +189,21 @@ def route_is_on(cfg):
     return any(r.get("outboundTag") == cfg["outbound_tag"] for r in d.get("routing", {}).get("rules", []))
 
 
-def ensure_access_log(cfg):
-    """Reactive mode needs x-ui's Xray access log. Turn it on if it's disabled."""
-    db = cfg["xui_db"]
-    tpl = read_template(db)
-    acc = (tpl.get("log") or {}).get("access", "")
-    if acc and acc not in ("none", "None"):
-        return
-    tpl.setdefault("log", {})["access"] = "./access.log"
-    backup_db(db)
-    write_template(db, tpl)
-    info("enabled Xray access log (required for reactive mode)")
-
-
-# ------------------------------------------------------------ refresh core --
-def last_refresh():
-    try:
-        return float(open(STATE).read().strip())
-    except Exception:
-        return 0.0
-
-
-def mark(ts=None):
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    open(STATE, "w").write(str(ts if ts is not None else time.time()))
-
-
-def do_refresh(cfg):
-    mark()  # mark first so buffered activity doesn't re-trigger mid-cycle
-    wlog("instagram activity -> refreshing region (residential ON)")
-    set_route(cfg, True, backup=False)
-    time.sleep(int(cfg["window_sec"]))
-    set_route(cfg, False, backup=False)
-    mark()
-    wlog("region refreshed (residential OFF)")
-
-
-# ------------------------------------------------------- residential check --
+# ------------------------------------------------------- outbound egress check --
 DATACENTER_HINTS = ("datacamp", "m247", "ovh", "hetzner", "amazon", "aws", "google",
                     "cloud", "digitalocean", "linode", "vultr", "leaseweb", "contabo",
-                    "choopa", "hosting", "server", "colo")
+                    "choopa", "hosting", "colo")
 MUSIC_COUNTRIES = {"US", "GB", "DE", "FR", "IT", "ES", "NL", "SE", "CA", "AU", "BR", "MX",
                    "JP", "KR", "IN", "TR", "AE", "SA", "PL", "PT", "IE", "BE", "AT", "CH",
                    "DK", "NO", "FI"}
 
 
 def check_proxy(cfg):
+    """Spin a throwaway xray on the outbound (any protocol) and report its egress ip/country."""
     db = cfg["xui_db"]; tag = cfg["outbound_tag"]
     xray = find_xray()
     if not xray:
-        warn("xray binary not found; skipping live proxy test")
+        warn("xray binary not found; skipping live egress test")
         return None
     out = get_outbound(read_template(db), tag)
     if not out:
@@ -314,115 +244,50 @@ def cmd_check(cfg, _):
     out = get_outbound(read_template(cfg["xui_db"]), cfg["outbound_tag"])
     if not out:
         err(f"no outbound tagged '{cfg['outbound_tag']}' found.")
-        print("\n  Add it in the x-ui panel:")
-        print("    Xray Settings -> Outbounds -> + -> Protocol: socks")
-        print(f"    Tag: {cfg['outbound_tag']}")
-        print("    Address / Port / Username / Password: your RESIDENTIAL proxy")
+        print("\n  Add it in the x-ui panel (Xray Settings -> Outbounds -> +).")
+        print("  It can be ANY protocol the panel supports (socks/http proxy, vless, vmess,")
+        print("  trojan, shadowsocks, wireguard, ...) as long as its egress IP is a US IP.")
+        print(f"  Give it the tag:  {cfg['outbound_tag']}")
         print("  then run `igmusic check` again.\n")
         sys.exit(2)
     ok(f"found outbound '{cfg['outbound_tag']}' (protocol {out.get('protocol')})")
-    info("testing the residential proxy (egress) ...")
+    info("testing the outbound egress ...")
     r = check_proxy(cfg)
     if not r or not r.get("ok"):
-        die("could not reach the internet through the residential outbound - check its credentials.")
+        die("could not reach the internet through the outbound - check its settings.")
     line = f"egress {r['ip']}  country={r['country']}  org={r['org']}"
     ok(line) if r["ig_reachable"] else warn(line)
-    (warn if r["datacenter"] else ok)(
-        "this looks like a DATACENTER IP - Instagram may still hide music."
-        if r["datacenter"] else "looks residential (not an obvious datacenter ASN)")
     (ok if r["music_country"] else warn)(
         f"{r['country']} is a music-licensed region" if r["music_country"]
-        else f"country {r['country']} may not have Instagram music - pick US/GB/DE/...")
+        else f"country {r['country']} may not have Instagram music - use a US IP (or GB/DE/...).")
+    if r["datacenter"]:
+        warn("egress looks like a DATACENTER IP - a residential/mobile US IP is more reliable for music.")
     print()
-    info("ready. run `sudo igmusic install` to enable automatic activation.")
-
-
-def _write_units(cfg):
-    for f in (SVC_REFRESH, TIMER, SVC_WATCH):
-        if os.path.exists(f):
-            os.remove(f)
-    if cfg["mode"] == "reactive":
-        open(SVC_WATCH, "w").write(
-            "[Unit]\nDescription=Instagram music reactive region refresh (igmusic watch)\n"
-            "After=x-ui.service\nWants=x-ui.service\n\n"
-            "[Service]\nType=simple\nExecStart=/usr/local/sbin/igmusic watch\n"
-            "Restart=always\nRestartSec=5\n\n"
-            "[Install]\nWantedBy=multi-user.target\n")
-    else:
-        open(SVC_REFRESH, "w").write(
-            "[Unit]\nDescription=Instagram music region refresh (igmusic)\n"
-            "After=x-ui.service\nWants=x-ui.service\n\n"
-            "[Service]\nType=oneshot\nExecStart=/usr/local/sbin/igmusic refresh\n"
-            "TimeoutStartSec=900\n")
-        open(TIMER, "w").write(
-            "[Unit]\nDescription=Run igmusic Instagram-music refresh every %d min\n\n" % int(cfg["interval_min"]) +
-            "[Timer]\nOnBootSec=3min\nOnUnitActiveSec=%dmin\n" % int(cfg["interval_min"]) +
-            "AccuracySec=1min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n")
+    info("ready. run `sudo igmusic install` to route Instagram's region check through it.")
 
 
 def cmd_install(cfg, args):
     need_root()
-    if args.mode:     cfg["mode"] = args.mode
-    if args.cooldown: cfg["cooldown_min"] = args.cooldown
-    if args.interval: cfg["interval_min"] = args.interval
-    if args.window:   cfg["window_sec"] = args.window
-    if args.tag:      cfg["outbound_tag"] = args.tag
-    if cfg["mode"] not in ("reactive", "timer"):
-        die("--mode must be 'reactive' or 'timer'")
+    if args.tag:
+        cfg["outbound_tag"] = args.tag
     if not get_outbound(read_template(cfg["xui_db"]), cfg["outbound_tag"]):
-        die(f"no outbound tagged '{cfg['outbound_tag']}'. Add it in the panel first (`igmusic check`).")
-    if cfg["mode"] == "reactive":
-        ensure_access_log(cfg)
-        cfg["access_log"] = access_log_path(cfg)
+        die(f"no outbound tagged '{cfg['outbound_tag']}'. Add a US-IP outbound with that tag first "
+            f"(`igmusic check`).")
     save_config(cfg)
-    _write_units(cfg)
-    mark(0)  # arm: refresh on the next Instagram activity / first timer fire
-    run(["systemctl", "daemon-reload"])
-    if cfg["mode"] == "reactive":
-        run(["systemctl", "enable", "--now", "igmusic-watch.service"])
-        ok(f"installed in REACTIVE mode: refresh when you use Instagram, at most every "
-           f"{cfg['cooldown_min']} min, {cfg['window_sec']}s window.")
-    else:
-        run(["systemctl", "enable", "--now", "igmusic-refresh.timer"])
-        ok(f"installed in TIMER mode: refresh every {cfg['interval_min']} min, {cfg['window_sec']}s window.")
-    info("doing a first activation now ...")
-    do_refresh(cfg)
-    ok("done. open Instagram (close & reopen) - the Music sticker should be back.")
+    info("adding static rule: %s -> '%s' ..." % (", ".join(cfg["hosts"]), cfg["outbound_tag"]))
+    set_route(cfg, True)
+    ok("done - Instagram's region check now goes through '%s' permanently." % cfg["outbound_tag"])
+    ok("open Instagram (close & reopen); the Music sticker should be back and stay.")
 
 
-def cmd_watch(cfg, _):
-    """Reactive daemon: refresh the region when Instagram activity is seen, honoring cooldown."""
+def cmd_uninstall(cfg, _):
     need_root()
-    access = access_log_path(cfg)
-    trigger = cfg["hosts"][0].split(":")[-1]  # e.g. i.instagram.com
-    cooldown = int(cfg["cooldown_min"]) * 60
-    while not os.path.exists(access):
-        time.sleep(5)
-    wlog(f"watcher started (cooldown {cfg['cooldown_min']}m, window {cfg['window_sec']}s, log {access})")
-    p = subprocess.Popen(["tail", "-F", "-n", "0", access], stdout=subprocess.PIPE, text=True)
-    for line in p.stdout:
-        if trigger in line and (time.time() - last_refresh() >= cooldown):
-            do_refresh(cfg)
+    set_route(cfg, False)
+    ok("removed: Instagram region check is back on the normal exit.")
+    info("your '%s' outbound and the rest of x-ui are untouched. Backups in %s" % (cfg["outbound_tag"], BACKUPS))
 
 
-def cmd_refresh(cfg, _):
-    need_root()
-    info("region refresh: routing %s through '%s' ..." % (", ".join(cfg["hosts"]), cfg["outbound_tag"]))
-    do_refresh(cfg)
-    ok("refresh cycle complete (residential route off again).")
-
-
-def cmd_on(cfg, _):
-    need_root(); set_route(cfg, True)
-    ok(f"'{cfg['outbound_tag']}' route ON for {', '.join(cfg['hosts'])} (until `igmusic off`).")
-
-
-def cmd_off(cfg, _):
-    need_root(); set_route(cfg, False)
-    ok("residential route OFF (all Instagram on the normal exit).")
-
-
-def _residential_bytes(cfg):
+def _outbound_bytes(cfg):
     rc = running_config(); xray = find_xray()
     if not rc or not xray:
         return None
@@ -440,57 +305,29 @@ def _residential_bytes(cfg):
 
 def cmd_status(cfg, _):
     on = route_is_on(cfg)
-    info("mode              : " + cfg["mode"])
-    info("residential route : " + ("ON" if on else "OFF" if on is not None else "unknown"))
-    info("outbound / hosts  : %s -> %s" % (cfg["outbound_tag"], ", ".join(cfg["hosts"])))
-    if cfg["mode"] == "reactive":
-        info("cooldown / window : %s min / %s s" % (cfg["cooldown_min"], cfg["window_sec"]))
-        info("watcher           : " + run(["systemctl", "is-active", "igmusic-watch.service"]).stdout.strip())
-        lr = last_refresh()
-        info("last refresh      : " + (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(lr)) if lr else "never"))
-    else:
-        info("interval / window : %s min / %s s" % (cfg["interval_min"], cfg["window_sec"]))
-        info("refresh timer     : " + run(["systemctl", "is-active", "igmusic-refresh.timer"]).stdout.strip())
-    b = _residential_bytes(cfg)
+    info("outbound tag      : " + cfg["outbound_tag"])
+    info("region hosts      : " + ", ".join(cfg["hosts"]))
+    info("static route      : " + ("ON (Instagram region check -> %s)" % cfg["outbound_tag"] if on
+                                    else "OFF (on the normal exit)" if on is not None else "unknown"))
+    b = _outbound_bytes(cfg)
     if b is not None:
-        info("residential used  : %.1f MB (since last xray restart)" % (b / 1048576))
-
-
-def cmd_uninstall(cfg, _):
-    need_root()
-    run(["systemctl", "disable", "--now", "igmusic-watch.service"])
-    run(["systemctl", "disable", "--now", "igmusic-refresh.timer"])
-    for f in (SVC_WATCH, SVC_REFRESH, TIMER):
-        if os.path.exists(f):
-            os.remove(f)
-    run(["systemctl", "daemon-reload"])
-    set_route(cfg, False)
-    ok("uninstalled: timers/watcher removed, residential route off, Instagram on the normal exit.")
-    info("your `residental` outbound and x-ui config are untouched. Backups kept in " + BACKUPS)
+        info("outbound used     : %.1f MB (since last xray restart)" % (b / 1048576))
 
 
 def main():
-    ap = argparse.ArgumentParser(prog=APP, description="Instagram Music Activation for x-ui panel")
+    ap = argparse.ArgumentParser(prog=APP, description="Instagram Music Activation for x-ui panel (static)")
     sub = ap.add_subparsers(dest="cmd")
-    sub.add_parser("check", help="verify x-ui + the residential outbound, test its egress")
-    pi = sub.add_parser("install", help="enable automatic activation")
-    pi.add_argument("--mode", choices=["reactive", "timer"], help="reactive (default) or timer")
-    pi.add_argument("--cooldown", type=int, help="reactive: min minutes between refreshes (default 90)")
-    pi.add_argument("--interval", type=int, help="timer: minutes between refreshes (default 90)")
-    pi.add_argument("--window", type=int, help="seconds the route stays on per refresh (default 180)")
-    pi.add_argument("--tag", help="outbound tag to use (default: residental)")
-    sub.add_parser("watch", help="reactive daemon (run by the systemd service)")
-    sub.add_parser("refresh", help="run one refresh cycle now")
-    sub.add_parser("on", help="route Instagram API through residential and leave it on")
-    sub.add_parser("off", help="send Instagram back to the normal exit")
-    sub.add_parser("status", help="show mode/route/usage")
-    sub.add_parser("uninstall", help="remove the watcher/timer and turn the route off")
+    sub.add_parser("check", help="verify x-ui + the outbound, test its egress IP/country")
+    pi = sub.add_parser("install", help="add the static rule (region check -> the outbound)")
+    pi.add_argument("--tag", help="outbound tag to use (default: IGMUSIC)")
+    sub.add_parser("uninstall", help="remove the rule (Instagram back on the normal exit)")
+    sub.add_parser("status", help="show the static route state and outbound usage")
     args = ap.parse_args()
     if not args.cmd:
         ap.print_help(); sys.exit(0)
     cfg = load_config()
-    {"check": cmd_check, "install": cmd_install, "watch": cmd_watch, "refresh": cmd_refresh,
-     "on": cmd_on, "off": cmd_off, "status": cmd_status, "uninstall": cmd_uninstall}[args.cmd](cfg, args)
+    {"check": cmd_check, "install": cmd_install, "uninstall": cmd_uninstall,
+     "status": cmd_status}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":
