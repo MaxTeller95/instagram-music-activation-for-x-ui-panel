@@ -60,7 +60,18 @@ IP, its country, and whether it looks residential.
    - **Tag it: `IGMUSIC`**
    - Save.
 
-2. On the server:
+2. On the server, either the one-liner **or** a git clone:
+
+**One-line (bash, no clone):**
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/MaxTeller95/instagram-music-activation-for-x-ui-panel/master/install.sh)"
+```
+
+> The one-liner downloads the CLI from the repo, so it needs the repo to be
+> **public**. For a private repo use the git-clone method below.
+
+**Git clone:**
 
 ```bash
 git clone https://github.com/MaxTeller95/instagram-music-activation-for-x-ui-panel.git
