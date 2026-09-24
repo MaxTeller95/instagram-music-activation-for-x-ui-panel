@@ -92,6 +92,48 @@ sudo igmusic uninstall      # remove the rule (Instagram back on the normal exit
 sudo igmusic install --tag MYNAME   # if you named the outbound something else
 ```
 
+## Staying inside a metered proxy's allowance
+
+Residential proxies are sold by the gigabyte, and on a panel with more than a
+couple of users `i.instagram.com` is not a trickle: on a hub with ~50 users
+online it measured **250 MB/hour, about 180 GB/month**. If the allowance runs
+out mid-month the proxy stops answering and then Instagram breaks completely -
+not just the music.
+
+`igmusic-budget` makes that failure a graceful one. It never touches the routing
+rule; it watches how much the outbound has carried, warns on Telegram on the way
+up, and when the allowance is gone it swaps the **outbound behind the tag** for a
+free one. The region-check hosts keep working from the server's normal IP - you
+lose the music sticker, not Instagram. On the first of the month it puts the
+residential outbound back. Every swap goes through Xray's API: nothing restarts
+and nobody is disconnected.
+
+```bash
+sudo igmusic-budget --limit 200        # your allowance, in GB per month
+sudo systemctl enable --now igmusic-budget.timer
+igmusic-budget                         # used / projected / parked?
+igmusic-budget --json
+sudo igmusic-budget park               # park it by hand
+sudo igmusic-budget resume
+```
+
+```
+[*]  outbound          : IGMUSIC
+[*]  month             : 2026-09  (day 24)
+[*]  used              : 42.10 of 200.0 GB  (21.1%)
+[*]  at this pace      : 54 GB by the end of the month
+[ok]  route            : residential
+```
+
+Alerts go out at 70%, 85% and 95% (`alert_at` in `/etc/igmusic/config.json`)
+through the panel's own Telegram bot, or `tg_token` / `tg_chat` if you set them.
+Xray's counters reset to zero on every restart, so the watcher stores the raw
+counter each tick and adds only what appeared since the previous one - a restart
+reads as the counter going backwards and is handled as such.
+
+If `/var/lib/igmusic/off.json` exists (an outbound with the same tag - a WARP
+config, say) it parks on that instead of plain `freedom`.
+
 ## Notes & caveats
 
 - Only `i.instagram.com` / `b.i.instagram.com` (small JSON API) go through the

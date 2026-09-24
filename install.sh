@@ -16,6 +16,12 @@ HERE="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
 if [ -n "${HERE:-}" ] && [ -f "$HERE/igmusic" ]; then
   # running from a git clone
   install -m 755 "$HERE/igmusic" /usr/local/sbin/igmusic
+  if [ -f "$HERE/igmusic-budget" ]; then
+    install -m 755 "$HERE/igmusic-budget" /usr/local/sbin/igmusic-budget
+    install -m 644 "$HERE/igmusic-budget.service" "$HERE/igmusic-budget.timer" /etc/systemd/system/
+    systemctl daemon-reload
+    echo "installed /usr/local/sbin/igmusic-budget (not enabled - see the README)"
+  fi
 else
   # running standalone (curl | bash): fetch the CLI from the repo
   echo "fetching igmusic ..."

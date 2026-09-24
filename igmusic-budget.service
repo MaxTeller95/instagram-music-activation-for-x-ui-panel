@@ -1,0 +1,7 @@
+[Unit]
+Description=igmusic: watch the residential outbound's monthly data allowance
+After=x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/igmusic-budget run

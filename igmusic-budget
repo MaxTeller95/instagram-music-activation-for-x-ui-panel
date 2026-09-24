@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+igmusic-budget - keep the residential exit inside its monthly data allowance.
+
+The routing stays exactly as `igmusic install` left it: one static rule, and
+nothing here ever touches it. This only *watches* how much data the outbound has
+carried this month, warns on Telegram on the way up, and - when the allowance is
+gone - parks the tag on a free exit so the region-check hosts keep working from
+the server's normal IP instead of dying with the proxy. It goes back by itself
+on the first of the month.
+
+Parking and resuming swap the OUTBOUND through Xray's API. Nothing restarts and
+nobody is disconnected.
+
+  igmusic-budget              # what it looks like right now
+  igmusic-budget run          # one tick - this is what the timer calls
+  igmusic-budget park         # park it by hand (free exit)
+  igmusic-budget resume       # back to the residential exit
+  igmusic-budget --json
+  igmusic-budget --limit 200  # set the monthly allowance, in GB
+
+Why the total is kept here instead of read from Xray: Xray's counters start at
+zero on every restart, so a tick stores the raw counter and adds only what has
+appeared since the previous tick. A restart shows up as the counter going
+backwards and is handled as such, so nothing is double counted or lost.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+BIN = "/usr/local/x-ui/bin"
+XRAY = BIN + "/xray-linux-amd64"
+LIVE = BIN + "/config.json"
+DB = "/etc/x-ui/x-ui.db"
+CONF = "/etc/igmusic/config.json"
+STATE_DIR = "/var/lib/igmusic"
+STATE = STATE_DIR + "/budget.json"
+SAVED_ON = STATE_DIR + "/outbound-on.json"   # the residential outbound, as the panel has it
+SAVED_OFF = STATE_DIR + "/off.json"          # a free outbound with the same tag, if you have one
+GB = 1024 ** 3
+
+_TTY = sys.stdout.isatty()
+
+
+def _c(code, s):
+    return "\033[%sm%s\033[0m" % (code, s) if _TTY else s
+
+
+def ok(s):
+    print(_c("32", "[ok] ") + s)
+
+
+def info(s):
+    print(_c("36", "[*]  ") + s)
+
+
+def warn(s):
+    print(_c("33", "[!]  ") + s)
+
+
+def die(s):
+    print(_c("31", "[x]  ") + s, file=sys.stderr)
+    sys.exit(1)
+
+
+def run(cmd, timeout=20):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return subprocess.CompletedProcess(cmd, 1, "", "timeout")
+
+
+def conf():
+    c = {"outbound_tag": "IGMUSIC", "monthly_gb": 200, "alert_at": [70, 85, 95]}
+    try:
+        c.update(json.load(open(CONF)))
+    except Exception:
+        pass
+    return c
+
+
+def month():
+    return time.strftime("%Y-%m")
+
+
+def state():
+    s = {"month": month(), "used": 0, "last": 0, "alerted": [], "parked": False}
+    try:
+        s.update(json.load(open(STATE)))
+    except Exception:
+        pass
+    return s
+
+
+def save_state(s):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    json.dump(s, open(tmp, "w"), indent=2)
+    os.replace(tmp, STATE)
+
+
+def api_addr():
+    """Where Xray's API listens, read from the config the panel is running."""
+    try:
+        cfg = json.load(open(LIVE))
+    except Exception:
+        return None
+    for i in cfg.get("inbounds", []):
+        if i.get("tag") == "api":
+            return "%s:%s" % (i.get("listen") or "127.0.0.1", i["port"])
+    return None
+
+
+def counter(tag, addr):
+    """Bytes the tag has carried since Xray last started, or None if the API is away."""
+    r = run([XRAY, "api", "statsquery", "--server=" + addr,
+             "-pattern", "outbound>>>%s>>>traffic" % tag])
+    try:
+        d = json.loads(r.stdout)
+    except Exception:
+        return None
+    return sum(int(x.get("value", 0)) for x in d.get("stat", []))
+
+
+def live_outbound(tag):
+    try:
+        cfg = json.load(open(LIVE))
+    except Exception:
+        return None
+    return next((o for o in cfg.get("outbounds", []) if o.get("tag") == tag), None)
+
+
+def remember_on(tag):
+    """Keep a copy of the real outbound so it can be put back after parking."""
+    if os.path.exists(SAVED_ON):
+        return True
+    o = live_outbound(tag)
+    if not o:
+        return False
+    os.makedirs(STATE_DIR, exist_ok=True)
+    json.dump({"outbounds": [o]}, open(SAVED_ON, "w"), indent=2)
+    os.chmod(SAVED_ON, 0o600)                # it usually carries the proxy's credentials
+    return True
+
+
+def free_outbound(tag):
+    """What to park on: your own off.json if there is one, otherwise plain freedom."""
+    if os.path.exists(SAVED_OFF):
+        return SAVED_OFF
+    path = STATE_DIR + "/outbound-free.json"
+    os.makedirs(STATE_DIR, exist_ok=True)
+    json.dump({"outbounds": [{"tag": tag, "protocol": "freedom", "settings": {}}]}, open(path, "w"))
+    return path
+
+
+def swap(tag, path, addr):
+    """Replace the outbound behind the tag. The routing rule is never touched."""
+    run([XRAY, "api", "rmo", "--server=" + addr, tag])
+    r = run([XRAY, "api", "ado", "--server=" + addr, path])
+    if r.returncode != 0:
+        run([XRAY, "api", "ado", "--server=" + addr, SAVED_ON])   # never leave the tag missing
+        return False
+    return True
+
+
+def tg(text):
+    c = conf()
+    token, chat = c.get("tg_token"), c.get("tg_chat")
+    if not token:
+        try:
+            import sqlite3
+            db = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
+            get = lambda k: (db.execute("select value from settings where key=?", (k,)).fetchone() or [""])[0]
+            token, chat = get("tgBotToken"), (get("tgBotChatId") or "").split(",")[0].strip()
+        except Exception:
+            return False
+    if not token or not chat:
+        return False
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text,
+                                   "disable_web_page_preview": "true"}).encode()
+    try:
+        with urllib.request.urlopen("https://api.telegram.org/bot%s/sendMessage" % token,
+                                    data=body, timeout=20) as r:
+            return b'"ok":true' in r.read()
+    except Exception:
+        return False
+
+
+def tick(c, s, addr, say=tg):
+    """Add what the outbound carried since the last tick, then act on the total."""
+    tag = c["outbound_tag"]
+    limit = int(float(c["monthly_gb"]) * GB)
+
+    if s["month"] != month():                                  # new month, full allowance again
+        was_parked = s["parked"]
+        s.update({"month": month(), "used": 0, "alerted": [], "parked": False})
+        if was_parked and remember_on(tag) and swap(tag, SAVED_ON, addr):
+            say("\U0001f504 ماه جدید — سهمیه صفر شد و مسیر برگشت روی آی‌پی رزیدنتال.")
+
+    remember_on(tag)            # keep the copy fresh while the panel is healthy, not at park time
+    cur = counter(tag, addr)
+    if cur is None:
+        return s, "api"
+    delta = cur - s["last"] if cur >= s["last"] else cur       # a restart zeroes Xray's counters
+    s["last"] = cur
+    if not s["parked"]:                                        # parked traffic is not residential
+        s["used"] += max(0, delta)
+
+    pct = 100.0 * s["used"] / limit if limit else 0
+    for a in sorted(int(x) for x in c.get("alert_at", [])):
+        if pct >= a and a not in s["alerted"]:
+            s["alerted"].append(a)
+            say("⚠️ سهمیه‌ی رزیدنتال %d%% مصرف شده (%.1f از %.0f گیگ این ماه)."
+                % (a, s["used"] / GB, limit / GB))
+
+    if pct >= 100 and not s["parked"]:
+        if remember_on(tag) and swap(tag, free_outbound(tag), addr):
+            s["parked"] = True
+            say("\U0001f6d1 سهمیه‌ی رزیدنتال تمام شد (%.0f گیگ). مسیر تا اول ماه روی خروجی رایگان "
+                "پارک شد — اینستاگرام کار می‌کند ولی موزیک نه." % (limit / GB))
+        else:
+            say("\U0001f6d1 سهمیه تمام شد ولی پارک‌کردن مسیر انجام نشد — دستی نگاه کنید.")
+    return s, None
+
+
+def show(c, s, addr, as_json=False):
+    limit = int(float(c["monthly_gb"]) * GB)
+    pct = 100.0 * s["used"] / limit if limit else 0
+    day = int(time.strftime("%d"))
+    pace = s["used"] / max(1, day) * 31
+    if as_json:
+        print(json.dumps({"tag": c["outbound_tag"], "month": s["month"],
+                          "used_gb": round(s["used"] / GB, 2), "limit_gb": c["monthly_gb"],
+                          "percent": round(pct, 1), "projected_gb": round(pace / GB, 1),
+                          "parked": s["parked"], "api": bool(addr)}, ensure_ascii=False))
+        return
+    info("outbound          : %s" % c["outbound_tag"])
+    info("month             : %s  (day %d)" % (s["month"], day))
+    info("used              : %.2f of %s GB  (%.1f%%)" % (s["used"] / GB, c["monthly_gb"], pct))
+    info("at this pace      : %.0f GB by the end of the month" % (pace / GB))
+    (warn if s["parked"] else ok)(
+        "route             : %s" % ("PARKED on the free exit" if s["parked"] else "residential"))
+    if not addr:
+        warn("Xray API          : not reachable")
+
+
+def main():
+    p = argparse.ArgumentParser(description="keep the residential exit inside its monthly allowance")
+    p.add_argument("cmd", nargs="?", default="status", choices=["status", "run", "park", "resume"])
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--limit", type=float, metavar="GB", help="set the monthly allowance and exit")
+    a = p.parse_args()
+
+    if a.limit is not None:
+        if os.geteuid() != 0:
+            die("run as root")
+        c = {}
+        try:
+            c = json.load(open(CONF))
+        except Exception:
+            pass
+        c["monthly_gb"] = a.limit
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        json.dump(c, open(CONF, "w"), indent=2)
+        ok("monthly allowance set to %g GB" % a.limit)
+        return
+
+    c, s, addr = conf(), state(), api_addr()
+    if a.cmd in ("run", "park", "resume") and os.geteuid() != 0:
+        die("run as root")
+
+    if a.cmd == "run":
+        if not addr:
+            die("no api inbound in %s - the panel must expose Xray's API" % LIVE)
+        s, err = tick(c, s, addr)
+        save_state(s)
+        if err == "api":
+            warn("Xray API not answering - nothing counted this tick")
+        return
+
+    if a.cmd in ("park", "resume"):
+        tag = c["outbound_tag"]
+        if not addr:
+            die("Xray API not reachable")
+        if not remember_on(tag):
+            die("no outbound tagged '%s' to fall back to" % tag)
+        if not swap(tag, free_outbound(tag) if a.cmd == "park" else SAVED_ON, addr):
+            die("the swap failed - the outbound was put back")
+        s["parked"] = a.cmd == "park"
+        save_state(s)
+        ok("route %s" % ("parked on the free exit" if s["parked"] else "back on the residential exit"))
+        return
+
+    show(c, s, addr, a.json)
+
+
+if __name__ == "__main__":
+    main()
