@@ -54,13 +54,23 @@ CONF_DIR = "/etc/igmusic"
 CONF = os.path.join(CONF_DIR, "config.json")
 BACKUPS = os.path.join(CONF_DIR, "backups")
 TEMPLATE_KEY = "xrayTemplateConfig"
+RULE_TAG = "igmusic"                    # so the rules can be found again, whoever wrote them
+QUIC_TAG = "igmusic-quic-block"
 
 DEFAULTS = {
     "xui_db": "",                       # auto-detected when empty
     "outbound_tag": "IGMUSIC",          # the US-IP outbound you added in the panel
     # Instagram reads your region from these API hosts; the heavy media (cdninstagram)
     # is deliberately NOT here, so it keeps using your free exit.
-    "hosts": ["full:i.instagram.com", "full:b.i.instagram.com"],
+    #   i.instagram.com / b.i.instagram.com - the region check, which gates the music
+    #     sticker on YOUR stories
+    #   graph.instagram.com - the music metadata for OTHER people's stories. Without it
+    #     the sticker comes back but their stories still say "Audio unavailable".
+    "hosts": ["full:i.instagram.com", "full:b.i.instagram.com", "full:graph.instagram.com"],
+    # A SOCKS proxy usually cannot carry UDP, so the app's HTTP/3 calls would go around
+    # the outbound and the region check would leak your real exit. Blocking QUIC for
+    # these hosts makes the app fall back to TCP, which the outbound does carry.
+    "block_quic": True,
 }
 
 _TTY = sys.stdout.isatty()
@@ -169,9 +179,21 @@ def set_route(cfg, on: bool):
     if on and not get_outbound(tpl, tag):
         die(f"no outbound tagged '{tag}' in the panel. Add a US-IP outbound with that tag first "
             f"(see `igmusic check`).")
-    rules = [r for r in tpl["routing"].get("rules", []) if r.get("outboundTag") != tag]
+    rules = [r for r in tpl["routing"].get("rules", [])
+             if r.get("outboundTag") != tag and r.get("ruleTag") != QUIC_TAG]
     if on:
-        rules.insert(0, {"type": "field", "outboundTag": tag, "domain": list(cfg["hosts"])})
+        rules.insert(0, {"type": "field", "ruleTag": RULE_TAG, "outboundTag": tag,
+                         "domain": list(cfg["hosts"])})
+        if cfg.get("block_quic", True):
+            hole = next((o.get("tag") for o in tpl.get("outbounds", [])
+                         if o.get("protocol") == "blackhole" and o.get("tag")), None)
+            if hole:
+                # first, so the UDP half never reaches the rule above
+                rules.insert(0, {"type": "field", "ruleTag": QUIC_TAG, "outboundTag": hole,
+                                 "network": "udp", "domain": list(cfg["hosts"])})
+            else:
+                warn("no blackhole outbound in the panel - QUIC is not blocked, so an app "
+                     "speaking HTTP/3 can slip past the outbound")
     tpl["routing"]["rules"] = rules
     backup_db(db)
     write_template(db, tpl)

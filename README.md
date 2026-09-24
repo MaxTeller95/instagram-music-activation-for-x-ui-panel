@@ -24,6 +24,17 @@ account — and that region gates the music sticker. The heavy media
 (`*.cdninstagram.com`, reels, photos, video, the music audio itself) is just a
 CDN and plays no part in the location decision.
 
+There are two separate gates, and they are answered by two different hosts:
+
+| What you want | Decided from | Host |
+|---|---|---|
+| The **Music sticker** on your own story | your account's region | `i.instagram.com` |
+| **Hearing** music on other people's stories | the music metadata call | `graph.instagram.com` |
+
+Route only the first and the sticker comes back while other people's stories
+still say *"Audio unavailable"* — that is the usual half-fixed state. All three
+hosts are in the defaults.
+
 ## What this tool does
 
 It permanently routes **only those two region-check hosts** through an outbound
@@ -136,9 +147,15 @@ config, say) it parks on that instead of plain `freedom`.
 
 ## Notes & caveats
 
-- Only `i.instagram.com` / `b.i.instagram.com` (small JSON API) go through the
-  outbound — never the media CDNs, so reels/photos/video and the music audio
-  stay on your free exit.
+- Only the API hosts (small JSON) go through the outbound — never the media
+  CDNs, so reels/photos/video and the music audio stay on your free exit.
+- **QUIC is blocked for those hosts.** A SOCKS proxy usually cannot carry UDP, so
+  an app speaking HTTP/3 would go around the outbound and Instagram would see
+  your real exit — the tool would look installed and do nothing. Blocking UDP for
+  exactly those hosts makes the app fall back to TCP. Set `"block_quic": false`
+  in `/etc/igmusic/config.json` if your outbound does carry UDP.
+- The rules carry the tags `igmusic` and `igmusic-quic-block`, so they can be
+  found (and removed) again later.
 - Applying / removing the rule restarts Xray once (a few seconds); after that it
   is completely static.
 - Music availability also depends on your **account's region**. If the account
