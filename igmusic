@@ -56,6 +56,7 @@ BACKUPS = os.path.join(CONF_DIR, "backups")
 TEMPLATE_KEY = "xrayTemplateConfig"
 RULE_TAG = "igmusic"                    # so the rules can be found again, whoever wrote them
 QUIC_TAG = "igmusic-quic-block"
+LEGACY_QUIC_TAGS = ("ig-quic-block",)   # written by hand / older setups; replaced, never duplicated
 
 DEFAULTS = {
     "xui_db": "",                       # auto-detected when empty
@@ -66,7 +67,10 @@ DEFAULTS = {
     #     sticker on YOUR stories
     #   graph.instagram.com - the music metadata for OTHER people's stories. Without it
     #     the sticker comes back but their stories still say "Audio unavailable".
-    "hosts": ["full:i.instagram.com", "full:b.i.instagram.com", "full:graph.instagram.com"],
+    #   i-fallback.instagram.com / edge-mqtt.facebook.com - the API fallback and the
+    #     realtime channel; left on the normal exit they can report the real region.
+    "hosts": ["full:i.instagram.com", "full:b.i.instagram.com", "full:i-fallback.instagram.com",
+              "full:edge-mqtt.facebook.com", "full:graph.instagram.com"],
     # A SOCKS proxy usually cannot carry UDP, so the app's HTTP/3 calls would go around
     # the outbound and the region check would leak your real exit. Blocking QUIC for
     # these hosts makes the app fall back to TCP, which the outbound does carry.
@@ -180,7 +184,8 @@ def set_route(cfg, on: bool):
         die(f"no outbound tagged '{tag}' in the panel. Add a US-IP outbound with that tag first "
             f"(see `igmusic check`).")
     rules = [r for r in tpl["routing"].get("rules", [])
-             if r.get("outboundTag") != tag and r.get("ruleTag") != QUIC_TAG]
+             if r.get("outboundTag") != tag
+             and r.get("ruleTag") not in (QUIC_TAG,) + LEGACY_QUIC_TAGS]
     if on:
         rules.insert(0, {"type": "field", "ruleTag": RULE_TAG, "outboundTag": tag,
                          "domain": list(cfg["hosts"])})

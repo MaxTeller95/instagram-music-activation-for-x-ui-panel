@@ -32,8 +32,10 @@ There are two separate gates, and they are answered by two different hosts:
 | **Hearing** music on other people's stories | the music metadata call | `graph.instagram.com` |
 
 Route only the first and the sticker comes back while other people's stories
-still say *"Audio unavailable"* — that is the usual half-fixed state. All three
-hosts are in the defaults.
+still say *"Audio unavailable"* — that is the usual half-fixed state. Both are in
+the defaults, together with `b.i.instagram.com`, the API fallback
+`i-fallback.instagram.com` and the realtime channel `edge-mqtt.facebook.com`, so
+no side channel reports the real region.
 
 ## What this tool does
 
